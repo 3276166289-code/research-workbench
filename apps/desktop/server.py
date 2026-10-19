@@ -485,6 +485,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/agent-settings", "/api/capabilities", "/api/workflow/layouts", "/api/feishu/", "/api/zotero/web/",
             "/api/projects", "/api/papers/", "/api/chats", "/api/assistants", "/api/teams/", "/api/runs/",
             "/api/audit/", "/api/easyscholar/", "/api/zotero/mcp/", "/api/todos", "/api/kanban", "/api/space/",
+            "/api/assets", "/api/workflow/run", "/api/workflow/runs", "/api/workflow/recover",
         )
         if not path.startswith(prefixes):
             return False
