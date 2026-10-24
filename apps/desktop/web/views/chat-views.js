@@ -11,7 +11,7 @@ function render(){
   else if(r==="calendar") renderCalendar(m);
   else if(r==="mail") renderMail(m);
   else if(r==="library") renderStar(m);                        // 知识星图整页（项目 → 文献/笔记/知识点/候选/工作流）
-  else if(r==="notes") renderNotes(m);
+  else if(r==="notes") { spTab = "notes"; renderSpace(m); }
   else if(r==="intel") renderIntel(m);
   else if(r==="assistants") renderAssistants(m);
   else if(r==="team") renderTeam(m);
@@ -442,7 +442,17 @@ function fmtAgo(iso){                        // 方案 A 的副标题用相对�
   return fmtDate(iso).slice(0, 10);
 }
 function projName(id){ return ((S.tasks||[]).find(x=>x.id===id)||{}).title || ""; }
+let ahCollapsed = localStorage.getItem("rw-ah-collapsed") === "true";
+
 function renderHistory(){
+  if(ahCollapsed){
+    return `<aside class="ah collapsed" aria-label="对话历史">
+      <button class="ah-expand-btn" id="ah-expand" title="展开对话历史">
+        <span>▶</span>
+        <span class="ah-expand-txt">对话历史</span>
+      </button>
+    </aside>`;
+  }
   const all = (S.chats||[]).slice();
   const groups = historyGroups(all);
   const byBorn = [...all].sort((a, b)=> String(a.created_at || "").localeCompare(String(b.created_at || "")));
@@ -464,7 +474,10 @@ function renderHistory(){
       ? `<div class="ah-group"><p class="ah-group-label">${k}<span class="ln"></span><i>${v.length}</i></p>${v.map(item).join("")}</div>` : "").join("");
   return `<aside class="ah" aria-label="对话历史">
     <div class="ah-head"><div><p class="eyebrow">WORKSPACE</p><h2>对话</h2></div>
-      <button class="ah-new" id="ah-new" title="新建对话">＋</button></div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <button class="ah-new" id="ah-new" title="新建对话">＋</button>
+        <button class="ah-collapse" id="ah-collapse" title="折叠对话列表">◀</button>
+      </div></div>
     <div class="ah-list">
       <div class="ah-bar"><label><input type="checkbox" id="ah-all" ${ahSel.size&&ahSel.size===(S.chats||[]).length?"checked":""}>全选 ${all.length} 个对话</label>
         <button class="ah-del-sel" id="ah-del-sel" ${ahSel.size?"":"disabled"}>删除选中 ${ahSel.size}</button></div>
@@ -496,7 +509,7 @@ function renderAgent(m){
   const cur = (S.chats||[]).find(t=>t.id===curChat);
   const boundA = (S.assistants||[]).find(a=>a.id === ((cur&&cur.assistant_id)||"")) || null;
   const recs = (S.chatEvents||[]).length;
-  m.innerHTML = `<div class="agent">
+  m.innerHTML = `<div class="agent${ahCollapsed ? " ah-collapsed" : ""}">
     ${renderHistory()}
     <section class="at" aria-label="对话主线">
       <header class="at-head">
@@ -587,7 +600,19 @@ function renderAgent(m){
     if(curChat===b.dataset.del){ curChat=null; localStorage.removeItem("rw-chat"); }
     await refreshState(false); render();
   });
-  $("ah-new").onclick = async ()=>{
+  const colBtn = $("ah-collapse");
+  if(colBtn) colBtn.onclick = () => {
+    ahCollapsed = true;
+    localStorage.setItem("rw-ah-collapsed", "true");
+    render();
+  };
+  const expBtn = $("ah-expand");
+  if(expBtn) expBtn.onclick = () => {
+    ahCollapsed = false;
+    localStorage.setItem("rw-ah-collapsed", "false");
+    render();
+  };
+  if($("ah-new")) $("ah-new").onclick = async ()=>{
     const r = await api("/api/chat/create",{title:""});      // 通用助手对话：不绑项目
     curChat = r.chat.id; localStorage.setItem("rw-chat",curChat);
     await refreshState(false); render();
@@ -675,6 +700,7 @@ async function maybeAskPermission(){
    await setPermissionMode("ask");
 }
 async function loadChat(){
+  restoreAgentRun();
   const requestedChat = curChat;
   try{
     const {messages} = await api(`/api/chat?id=${encodeURIComponent(curChat)}`);
@@ -917,6 +943,96 @@ document.addEventListener("click",(e)=>{          // 点菜单外面收起（监
 
 let activeAgentRun = "", activeAgentChat = "", activeAgentBase = [], activeAgentEvents = [];
 let agentHistoryIndex = -1, agentHistoryDraft = "";
+
+async function observeAgentRun(run, onEvent, remember, disconnected){
+  let delay = 300;
+  while(run.status === "running"){
+    try{
+      const res = run.runId
+        ? await fetch(`/api/runs/${encodeURIComponent(run.runId)}/stream?after=${run.cursor}`)
+        : await fetch(run.api,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(run.request)});
+      if(!res.ok || !res.body){
+        if(res.status >= 400 && res.status < 500){
+          run.status = "failed";
+          const body = await res.json().catch(()=>({}));
+          onEvent({type:"error",message:body.error || "运行请求已失效，请重新发起。"});
+          break;
+        }
+        throw new Error("HTTP " + res.status);
+      }
+      const reader = res.body.getReader(), decoder = new TextDecoder();
+      let buffer = "";
+      try{
+        while(run.status === "running"){
+          const {value,done} = await reader.read(); if(done) break;
+          buffer += decoder.decode(value,{stream:true}).replace(/\r\n/g,"\n");
+          let i;
+          while((i = buffer.indexOf("\n\n")) >= 0){
+            const block = buffer.slice(0,i); buffer = buffer.slice(i+2);
+            const line = block.split("\n").find(l=>l.startsWith("data: ")); if(!line) continue;
+            const id = Number((block.split("\n").find(l=>l.startsWith("id: ")) || "id: 0").slice(4));
+            if(id && id <= run.cursor) continue;
+            const wire = JSON.parse(line.slice(6)), ev = wire.payload || wire;
+            run.cursor = id || run.cursor;
+            if(ev.type === "run_started"){
+              run.runId = ev.run_id; remember(run); continue;
+            }
+            if(["done","error","cancelled"].includes(ev.type)) run.status = ev.type;
+            onEvent(ev);
+          }
+        }
+      }finally{ await reader.cancel().catch(()=>{}); }
+      if(run.status === "running" && run.runId){
+        const state = await api(`/api/runs/${encodeURIComponent(run.runId)}`);
+        if(["done","failed","cancelled","interrupted"].includes(state.status)){
+          run.status = state.status;
+          if(state.status === "interrupted") onEvent({type:"error",message:"任务中断，请核对已生成的产物后再继续。"});
+        }
+      }
+      delay = 300;
+    }catch(e){ if(disconnected) disconnected(e); }
+    if(run.status === "running"){
+      await new Promise(resolve=>setTimeout(resolve,delay)); delay = Math.min(delay*2,5000);
+    }
+  }
+}
+
+function rememberAgentRun(run){ localStorage.setItem("rw-agent-run",JSON.stringify(run)); }
+function restoreAgentRun(){
+  if(activeAgentRun) return;
+  let run;
+  try{ run = JSON.parse(localStorage.getItem("rw-agent-run") || "null"); }catch(e){}
+  if(!run) return;
+  activeAgentRun = run.key; activeAgentChat = run.request.task_id;
+  activeAgentBase = run.base || []; activeAgentEvents = [{type:"user",content:run.request.message}];
+  run.status = "running"; run.cursor = 0;
+  followChatRun(run);
+}
+async function followChatRun(run){
+  let error = "";
+  rememberAgentRun(run);
+  await observeAgentRun(run, ev=>{
+    if(ev.type === "error") error = ev.message || "执行失败";
+    if(!["done","user"].includes(ev.type)){
+      activeAgentEvents.push(ev);
+      const box = route() === "agent" && curChat === activeAgentChat ? $("msgs") : null;
+      if(box) appendOne(box,ev);
+    }
+    stEvent(ev);
+  },rememberAgentRun,()=>{
+    if($("send")) $("send").title = "连接中断，正在重连；按 Esc 停止";
+  });
+  localStorage.removeItem("rw-agent-run");
+  activeAgentRun = ""; activeAgentEvents = []; activeAgentBase = [];
+  const button = $("send");
+  if(button){ button.classList.remove("stop"); button.textContent = "↑"; button.title = "发送"; }
+  if($("projbind")) $("projbind").disabled = false;
+  await refreshState(false);
+  if(route() === "agent"){
+    await loadChat();
+    if(error && curChat === run.request.task_id && $("msgs")) appendOne($("msgs"),{type:"error",message:error});
+  }
+}
 async function cancelAgentRun(){
   if(!activeAgentRun) return;
   const key=activeAgentRun;
@@ -946,33 +1062,8 @@ async function send(){
   appendOne(box,{type:"user",content:msg});
    const btn=$("send"); activeAgentRun=crypto.randomUUID(); btn.classList.add("stop"); btn.textContent="■";
   if($("projbind")) $("projbind").disabled=true;
-  let errMsg="";
-  try{
-     const res = await fetch("/api/agent",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({task_id:curChat,message:msg,idempotency_key:activeAgentRun})});
-    if(!res.ok || !res.body) throw new Error("HTTP "+res.status);
-    const reader=res.body.getReader(); const dec=new TextDecoder(); let buf="";
-    for(;;){
-      const {value,done}=await reader.read(); if(done) break;
-      buf+=dec.decode(value,{stream:true});
-      let i;
-      while((i=buf.indexOf("\n\n"))>=0){
-        const chunk=buf.slice(0,i); buf=buf.slice(i+2);
-        const line=chunk.split("\n").find(l=>l.startsWith("data: ")); if(!line) continue;
-        let ev; try{ ev=JSON.parse(line.slice(6)); }catch{ continue; }
-         if(ev.type!=="done" && ev.type!=="user"){
-           activeAgentEvents.push(ev);
-           const liveBox=route()==="agent" && curChat===activeAgentChat ? $("msgs") : null;
-           if(liveBox) appendOne(liveBox,ev);
-         }
-        stEvent(ev);
-      }
-    }
-  }catch(e){ errMsg = e.message; appendOne(box,{type:"error",message:e.message}); }
-   activeAgentRun=""; activeAgentEvents=[]; activeAgentBase=[];
-   const liveButton=$("send"); if(liveButton){ liveButton.classList.remove("stop"); liveButton.textContent="↑"; }
-   if($("projbind")) $("projbind").disabled=false;
-  await refreshState(false); await loadChat();
-  if(errMsg) appendOne(box,{type:"error",message:errMsg});   // loadChat 重渲染会把报错行刷掉，补回去
+  await followChatRun({key:activeAgentRun,api:"/api/agent",runId:"",cursor:0,status:"running",base:activeAgentBase,
+    request:{task_id:curChat,message:msg,idempotency_key:activeAgentRun}});
 }
 /* 展示区：对话轮数 / 调用工具数 / 消耗 token（各一行）+ 工具名称、产出目录（各三行滚动） */
 const st = { turns:0, calls:0, tokBase:0, tok:0, tools:[], outs:[] };

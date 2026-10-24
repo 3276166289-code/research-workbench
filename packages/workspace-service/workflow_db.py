@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import re
 import socket
 import time
@@ -26,6 +27,7 @@ import fileguard        # 文件安全：子进程环境洗白 / 写前快照 / 
 import guards          # 出站脱敏 + 引用核验（见 guards.py）
 import memory_store    # 记忆体系：全局/项目两层、可改可删、FTS 检索
 import paths            # 唯一路径来源（data / user / executors 都在 HOME 下）
+import project_notes
 import securestore      # 凭据保护（DPAPI，见 securestore.py）
 from research_core import ResearchDB
 from workflow_search import make_project_tree   # 建项目骨架（pdir 里懒建目录用）
@@ -166,9 +168,9 @@ WELCOME_TEXT = (
     "先说说你的研究方向，再给一句话研究问题，我帮你把项目建起来。只想随便聊也行。这条对话随时可以删。"
 )
 STAGE_LABEL = {
-    "idea": "创新点审查", "search": "论文搜索", "download": "下载精读",
-    "notes": "论文翻译", "outline": "确认大纲", "map": "梳理精读", "write": "文章撰写", "review": "审查",
-    "entrans": "中译英", "convert": "格式转换",
+    "idea": "创新点审查", "search": "文献检索", "download": "文献入库",
+    "notes": "文献精读", "outline": "拟定框架", "map": "证据链谱系", "write": "论文撰写", "review": "AI预审查",
+    "entrans": "学术英译", "convert": "格式排版",
 }
 
 
@@ -176,7 +178,8 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def current_stage_key(conn: Any, task_id: str) -> str:
+def current_stage_key(conn: Any, task_id: str, order: list[str] | None = None,
+                      states: dict | None = None) -> str:
     """当前阶段 = 十步里「按顺序最靠后的已完成步」（用户 2026-10-21 定的口径）。
 
     他跳着做：正文写了、格式转了，精读/翻译还没补完。按「第一处缺口」算会永远停在
@@ -184,28 +187,33 @@ def current_stage_key(conn: Any, task_id: str) -> str:
     正在跑的那步、再退回第一步。
     项目空间的页头 pill 与「进度与计划」看板都走这一个函数，别各算一套。
     """
+    order = order or STAGES
     done: set[str] = set()
     running: list[str] = []
     try:
-        for row in conn.execute("SELECT stage,status FROM steps WHERE task_id=? ORDER BY rowid", (task_id,)):
-            if row["stage"] not in STAGE_LABEL:
+        latest = {r["stage"]: r["status"] for r in conn.execute(
+            "SELECT stage,status FROM steps WHERE task_id=? ORDER BY rowid", (task_id,))}
+        if states is not None:
+            latest = {key: value["status"] for key, value in states.items()}
+        for stage, status in latest.items():
+            if stage not in order:
                 continue                       # agent 之类不属于十步
-            if row["status"] == "done":
-                done.add(row["stage"])
-            elif row["status"] == "running":
-                running.append(row["stage"])
+            if status in ("done", "succeeded", "delivered", "stale"):
+                done.add(stage)
+            elif status == "running":
+                running.append(stage)
     except Exception:
         pass
-    ordered = [s for s in STAGES if s in done]
+    ordered = [s for s in order if s in done]
     pending = [k for k in running if k not in done]
     # 当前步 = 最后一个已完成步之后的 running；其前的 running 是崩溃残留，不算。
-    last_done_idx = STAGES.index(ordered[-1]) if ordered else -1
-    frontier = [k for k in pending if STAGES.index(k) >= last_done_idx]
+    last_done_idx = order.index(ordered[-1]) if ordered else -1
+    frontier = [k for k in order if k in pending and order.index(k) >= last_done_idx]
     if frontier:
         return frontier[-1]
     if ordered:
         return ordered[-1]
-    return pending[-1] if pending else (STAGES[0] if STAGES else "")
+    return pending[-1] if pending else (order[0] if order else "")
 
 
 def _text(value: str) -> str:
@@ -266,127 +274,140 @@ PROJ_DIRS: list[tuple[str, str]] = [
 ]
 
 
+_WORKFLOW_SCHEMA_INITIALIZED: set[str] = set()
+_WORKFLOW_INIT_LOCK = threading.Lock()
+
+
 class WorkflowDB(ResearchDB):
 
     def __init__(self, path: str | Path):
         super().__init__(path)
-        self.db.executescript(WORKFLOW_SCHEMA)
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chats)")}
-        if "assistant_id" not in cols:                # 老库补列：对话绑的助手（我的/公开）
-            self.db.execute("ALTER TABLE chats ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
-        if "task_id" not in cols:                     # 老库补列：对话绑的项目（'' = 随意对话）
-            self.db.execute("ALTER TABLE chats ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
-        # 老库补列（早期版本 providers 只有 6 列）
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(providers)")}
-        if "source" not in cols:
-            self.db.execute("ALTER TABLE providers ADD COLUMN source TEXT NOT NULL DEFAULT 'builtin'")
-        if "enabled" not in cols:
-            self.db.execute("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(calendar_events)")}
-        if "done" not in cols:
-            self.db.execute("ALTER TABLE calendar_events ADD COLUMN done INTEGER NOT NULL DEFAULT 0")
-        if "time" not in cols:                          # 老库补列：当天的钟点 HH:MM（空 = 没定时间）
-            self.db.execute("ALTER TABLE calendar_events ADD COLUMN time TEXT NOT NULL DEFAULT ''")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(research_tasks)")}
-        if "base_dir" not in cols:                      # 老库补列：项目位置
-            self.db.execute("ALTER TABLE research_tasks ADD COLUMN base_dir TEXT NOT NULL DEFAULT ''")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(md_notes)")}
-        if "task_id" not in cols:                       # 老库补列：大笔记可选绑项目
-            self.db.execute("ALTER TABLE md_notes ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
-        if "paper_id" not in cols:                      # 老库补列：阅读笔记绑论文（论文又绑项目）
-            self.db.execute("ALTER TABLE md_notes ADD COLUMN paper_id TEXT NOT NULL DEFAULT ''")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chat)")}
-        if "scope" not in cols:                         # 老库补列：各步骤的对话分开存
-            self.db.execute("ALTER TABLE chat ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS dl_queue (
-              task_id TEXT NOT NULL, result_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
-              path TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
-              PRIMARY KEY (task_id, result_id))""")
-        # 团队（Leader + 成员 + 派活队列 + 运行事件）
-        self.db.execute("""CREATE TABLE IF NOT EXISTS assistants (
-  id TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'user', name TEXT NOT NULL,
-  avatar TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
-  rules TEXT NOT NULL DEFAULT '', prompts TEXT NOT NULL DEFAULT '[]',
-  model_id TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
-  sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS team_members (
-              id TEXT PRIMARY KEY, task_id TEXT NOT NULL, name TEXT NOT NULL,
-              role TEXT NOT NULL DEFAULT 'member', step TEXT NOT NULL DEFAULT '',
-              prompt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
-              note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS team_tasks (
-              id TEXT PRIMARY KEY, task_id TEXT NOT NULL, member_id TEXT NOT NULL DEFAULT '',
-              member_name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
-              prompt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued',
-              created_at TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '', ended_at TEXT NOT NULL DEFAULT '',
-              output_path TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
-              reason TEXT NOT NULL DEFAULT '', trigger TEXT NOT NULL DEFAULT 'leader',
-              origin TEXT NOT NULL DEFAULT '')""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS team_events (
-              id TEXT PRIMARY KEY, team_task_id TEXT NOT NULL, task_id TEXT NOT NULL,
-              kind TEXT NOT NULL DEFAULT 'note', text TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL)""")
-        self.db.execute("CREATE INDEX IF NOT EXISTS idx_team_tasks_status ON team_tasks(status)")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS schedules (
-              id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL DEFAULT '',
-              project_id TEXT NOT NULL DEFAULT '', frequency TEXT NOT NULL DEFAULT 'daily',
-              cron TEXT NOT NULL DEFAULT '0 9 * * *', output_dir TEXT NOT NULL DEFAULT '定时任务',
-              enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '',
-              next_run_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
-              id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
-              trigger TEXT NOT NULL DEFAULT 'scheduler', status TEXT NOT NULL DEFAULT 'running',
-              started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT '',
-              summary TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '')""")
-        cols_sch = {r["name"] for r in self.db.execute("PRAGMA table_info(schedules)")}
-        if "last_run_at" not in cols_sch:
-            self.db.execute("ALTER TABLE schedules ADD COLUMN last_run_at TEXT NOT NULL DEFAULT ''")
-        if "next_run_at" not in cols_sch:
-            self.db.execute("ALTER TABLE schedules ADD COLUMN next_run_at TEXT NOT NULL DEFAULT ''")
-        if "assistant_id" not in cols_sch:
-            self.db.execute("ALTER TABLE schedules ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
-        cols_runs = {r["name"] for r in self.db.execute("PRAGMA table_info(schedule_runs)")}
-        if "name" not in cols_runs:
-            self.db.execute("ALTER TABLE schedule_runs ADD COLUMN name TEXT NOT NULL DEFAULT ''")
-        if "trigger" not in cols_runs:
-            self.db.execute("ALTER TABLE schedule_runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduler'")
-        if "reason" not in cols_runs:
-            self.db.execute("ALTER TABLE schedule_runs ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
-        self.assistant_seed(BUILTIN_ASSISTANTS)      # 公开助手（内置）：只补缺，不覆盖改过的
-        self.db.execute("UPDATE schedules SET assistant_id='builtin-steward' WHERE id LIKE 'builtin.schedule.%' AND assistant_id=''")
-        _recent = self.db.execute("SELECT id FROM research_tasks ORDER BY updated_at DESC LIMIT 1").fetchone()
-        self.schedule_seed(BUILTIN_SCHEDULES, _recent["id"] if _recent else "")   # 内置定时任务：只补缺（没有项目就先留空，等用户绑）
-        self.db.execute("""CREATE TABLE IF NOT EXISTS teams (
-              id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'fixed',
-              status TEXT NOT NULL DEFAULT 'idle', project_id TEXT NOT NULL DEFAULT '',
-              purpose TEXT NOT NULL DEFAULT '',
-              created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(teams)")}
-        if "project_id" not in cols:                   # 老库补列：团队挂在项目上
-            self.db.execute("ALTER TABLE teams ADD COLUMN project_id TEXT NOT NULL DEFAULT ''")
-        if "purpose" not in cols:                      # 老库补列：加急团队「为什么组」
-            self.db.execute("ALTER TABLE teams ADD COLUMN purpose TEXT NOT NULL DEFAULT ''")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(team_members)")}
-        if "assistant_id" not in cols:                 # 老库补列：成员 = 哪个助手
-            self.db.execute("ALTER TABLE team_members ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
-        if "color" not in cols:                        # 老库补列：成员身份色序号
-            self.db.execute("ALTER TABLE team_members ADD COLUMN color INTEGER NOT NULL DEFAULT 0")
-        cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chat)")}
-        if "sender" not in cols:                       # 老库补列：团队群里这条是谁说的
-            self.db.execute("ALTER TABLE chat ADD COLUMN sender TEXT NOT NULL DEFAULT ''")
-        import agent_settings
-        agent_settings.migrate(self)
-        for _t in ("providers", "model_profiles"):        # key 绑定的域名（换域名就不许拿旧 key 发）
-            _cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({_t})")}
-            if "key_host" not in _cols:
-                self.db.execute(f"ALTER TABLE {_t} ADD COLUMN key_host TEXT NOT NULL DEFAULT ''")
-        encrypt_legacy_secrets(self)                   # 老库里的明文 key → DPAPI 密文（幂等）
-        self.db.commit()
+        is_memory = str(self.path) == ":memory:"
+        db_key = ":memory:" if is_memory else f"{self.path.resolve()}:{self.path.stat().st_ino}"
+        if not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='steps'").fetchone():
+            _WORKFLOW_SCHEMA_INITIALIZED.discard(db_key)
+        if is_memory or db_key not in _WORKFLOW_SCHEMA_INITIALIZED:
+            with _WORKFLOW_INIT_LOCK:
+                if is_memory or db_key not in _WORKFLOW_SCHEMA_INITIALIZED:
+                    self.db.executescript(WORKFLOW_SCHEMA)
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chats)")}
+                    if "assistant_id" not in cols:                # 老库补列：对话绑的助手（我的/公开）
+                        self.db.execute("ALTER TABLE chats ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
+                    if "task_id" not in cols:                     # 老库补列：对话绑的项目（'' = 随意对话）
+                        self.db.execute("ALTER TABLE chats ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
+                    # 老库补列（早期版本 providers 只有 6 列）
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(providers)")}
+                    if "source" not in cols:
+                        self.db.execute("ALTER TABLE providers ADD COLUMN source TEXT NOT NULL DEFAULT 'builtin'")
+                    if "enabled" not in cols:
+                        self.db.execute("ALTER TABLE providers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 0")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(calendar_events)")}
+                    if "done" not in cols:
+                        self.db.execute("ALTER TABLE calendar_events ADD COLUMN done INTEGER NOT NULL DEFAULT 0")
+                    if "time" not in cols:                          # 老库补列：当天的钟点 HH:MM（空 = 没定时间）
+                        self.db.execute("ALTER TABLE calendar_events ADD COLUMN time TEXT NOT NULL DEFAULT ''")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(research_tasks)")}
+                    if "base_dir" not in cols:                      # 老库补列：项目位置
+                        self.db.execute("ALTER TABLE research_tasks ADD COLUMN base_dir TEXT NOT NULL DEFAULT ''")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(md_notes)")}
+                    if "task_id" not in cols:                       # 老库补列：大笔记可选绑项目
+                        self.db.execute("ALTER TABLE md_notes ADD COLUMN task_id TEXT NOT NULL DEFAULT ''")
+                    if "paper_id" not in cols:                      # 老库补列：阅读笔记绑论文（论文又绑项目）
+                        self.db.execute("ALTER TABLE md_notes ADD COLUMN paper_id TEXT NOT NULL DEFAULT ''")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chat)")}
+                    if "scope" not in cols:                         # 老库补列：各步骤的对话分开存
+                        self.db.execute("ALTER TABLE chat ADD COLUMN scope TEXT NOT NULL DEFAULT ''")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS dl_queue (
+                          task_id TEXT NOT NULL, result_id TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued',
+                          path TEXT NOT NULL DEFAULT '', error TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL,
+                          PRIMARY KEY (task_id, result_id))""")
+                    # 团队（Leader + 成员 + 派活队列 + 运行事件）
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS assistants (
+              id TEXT PRIMARY KEY, source TEXT NOT NULL DEFAULT 'user', name TEXT NOT NULL,
+              avatar TEXT NOT NULL DEFAULT '', description TEXT NOT NULL DEFAULT '',
+              rules TEXT NOT NULL DEFAULT '', prompts TEXT NOT NULL DEFAULT '[]',
+              model_id TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 1,
+              sort_order INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+            )""")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS team_members (
+                          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, name TEXT NOT NULL,
+                          role TEXT NOT NULL DEFAULT 'member', step TEXT NOT NULL DEFAULT '',
+                          prompt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'idle',
+                          note TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS team_tasks (
+                          id TEXT PRIMARY KEY, task_id TEXT NOT NULL, member_id TEXT NOT NULL DEFAULT '',
+                          member_name TEXT NOT NULL DEFAULT '', title TEXT NOT NULL DEFAULT '',
+                          prompt TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'queued',
+                          created_at TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '', ended_at TEXT NOT NULL DEFAULT '',
+                          output_path TEXT NOT NULL DEFAULT '', result TEXT NOT NULL DEFAULT '',
+                          reason TEXT NOT NULL DEFAULT '', trigger TEXT NOT NULL DEFAULT 'leader',
+                          origin TEXT NOT NULL DEFAULT '')""")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS team_events (
+                          id TEXT PRIMARY KEY, team_task_id TEXT NOT NULL, task_id TEXT NOT NULL,
+                          kind TEXT NOT NULL DEFAULT 'note', text TEXT NOT NULL DEFAULT '',
+                          created_at TEXT NOT NULL)""")
+                    self.db.execute("CREATE INDEX IF NOT EXISTS idx_team_tasks_status ON team_tasks(status)")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS schedules (
+                          id TEXT PRIMARY KEY, name TEXT NOT NULL, prompt TEXT NOT NULL DEFAULT '',
+                          project_id TEXT NOT NULL DEFAULT '', frequency TEXT NOT NULL DEFAULT 'daily',
+                          cron TEXT NOT NULL DEFAULT '0 9 * * *', output_dir TEXT NOT NULL DEFAULT '定时任务',
+                          enabled INTEGER NOT NULL DEFAULT 1, last_run_at TEXT NOT NULL DEFAULT '',
+                          next_run_at TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS schedule_runs (
+                          id TEXT PRIMARY KEY, schedule_id TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                          trigger TEXT NOT NULL DEFAULT 'scheduler', status TEXT NOT NULL DEFAULT 'running',
+                          started_at TEXT NOT NULL, ended_at TEXT NOT NULL DEFAULT '', output_path TEXT NOT NULL DEFAULT '',
+                          summary TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '')""")
+                    cols_sch = {r["name"] for r in self.db.execute("PRAGMA table_info(schedules)")}
+                    if "last_run_at" not in cols_sch:
+                        self.db.execute("ALTER TABLE schedules ADD COLUMN last_run_at TEXT NOT NULL DEFAULT ''")
+                    if "next_run_at" not in cols_sch:
+                        self.db.execute("ALTER TABLE schedules ADD COLUMN next_run_at TEXT NOT NULL DEFAULT ''")
+                    if "assistant_id" not in cols_sch:
+                        self.db.execute("ALTER TABLE schedules ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
+                    cols_runs = {r["name"] for r in self.db.execute("PRAGMA table_info(schedule_runs)")}
+                    if "name" not in cols_runs:
+                        self.db.execute("ALTER TABLE schedule_runs ADD COLUMN name TEXT NOT NULL DEFAULT ''")
+                    if "trigger" not in cols_runs:
+                        self.db.execute("ALTER TABLE schedule_runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'scheduler'")
+                    if "reason" not in cols_runs:
+                        self.db.execute("ALTER TABLE schedule_runs ADD COLUMN reason TEXT NOT NULL DEFAULT ''")
+                    self.assistant_seed(BUILTIN_ASSISTANTS)      # 公开助手（内置）：只补缺，不覆盖改过的
+                    self.db.execute("UPDATE schedules SET assistant_id='builtin-steward' WHERE id LIKE 'builtin.schedule.%' AND assistant_id=''")
+                    _recent = self.db.execute("SELECT id FROM research_tasks ORDER BY updated_at DESC LIMIT 1").fetchone()
+                    self.schedule_seed(BUILTIN_SCHEDULES, _recent["id"] if _recent else "")   # 内置定时任务：只补缺（没有项目就先留空，等用户绑）
+                    self.db.execute("""CREATE TABLE IF NOT EXISTS teams (
+                          id TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'fixed',
+                          status TEXT NOT NULL DEFAULT 'idle', project_id TEXT NOT NULL DEFAULT '',
+                          purpose TEXT NOT NULL DEFAULT '',
+                          created_at TEXT NOT NULL, updated_at TEXT NOT NULL)""")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(teams)")}
+                    if "project_id" not in cols:                   # 老库补列：团队挂在项目上
+                        self.db.execute("ALTER TABLE teams ADD COLUMN project_id TEXT NOT NULL DEFAULT ''")
+                    if "purpose" not in cols:                      # 老库补列：加急团队「为什么组」
+                        self.db.execute("ALTER TABLE teams ADD COLUMN purpose TEXT NOT NULL DEFAULT ''")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(team_members)")}
+                    if "assistant_id" not in cols:                 # 老库补列：成员 = 哪个助手
+                        self.db.execute("ALTER TABLE team_members ADD COLUMN assistant_id TEXT NOT NULL DEFAULT ''")
+                    if "color" not in cols:                        # 老库补列：成员身份色序号
+                        self.db.execute("ALTER TABLE team_members ADD COLUMN color INTEGER NOT NULL DEFAULT 0")
+                    cols = {r["name"] for r in self.db.execute("PRAGMA table_info(chat)")}
+                    if "sender" not in cols:                       # 老库补列：团队群里这条是谁说的
+                        self.db.execute("ALTER TABLE chat ADD COLUMN sender TEXT NOT NULL DEFAULT ''")
+                    import agent_settings
+                    agent_settings.migrate(self)
+                    for _t in ("providers", "model_profiles"):        # key 绑定的域名（换域名就不许拿旧 key 发）
+                        _cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({_t})")}
+                        if "key_host" not in _cols:
+                            self.db.execute(f"ALTER TABLE {_t} ADD COLUMN key_host TEXT NOT NULL DEFAULT ''")
+                    encrypt_legacy_secrets(self)                   # 老库里的明文 key → DPAPI 密文（幂等）
+                    self.db.commit()
+                    for folder in (PAPERS, NOTES, OUT):
+                        folder.mkdir(parents=True, exist_ok=True)
+                    if not is_memory:
+                        _WORKFLOW_SCHEMA_INITIALIZED.add(db_key)
         import project_sources
         project_sources.restore_source_protection(self)
-        for folder in (PAPERS, NOTES, OUT):
-            folder.mkdir(parents=True, exist_ok=True)
 
     def create_task(self, title: str, question: str = "", material_system: str = "", base_dir: str = "") -> str:
         chosen = str(base_dir or "").strip()
@@ -428,15 +449,22 @@ class WorkflowDB(ResearchDB):
         if getattr(self, "quiet_steps", False):
             return {"id": "", "stage": stage, "status": status, "summary": summary,
                     "delivery": blob, "created_at": now(), "skipped": True}
+        if stage in STAGES and status == "done" and not delivery:
+            status = "succeeded"
         row = (uuid.uuid4().hex, task_id, stage, status, summary, now())
         self.db.execute("INSERT INTO steps (id,task_id,stage,status,summary,created_at,delivery)"
                         " VALUES (?,?,?,?,?,?,?)", row + (blob,))
         self.db.commit()
+        if stage in STAGES:
+            import project_todos
+            project_todos.sync_stage(self, task_id, stage, {
+                "running": "IN_PROGRESS", "succeeded": "REVIEW", "delivered": "DONE",
+                "failed": "TODO", "cancelled": "TODO"}.get(status, "TODO"))
         return {"id": row[0], "stage": stage, "status": status, "summary": summary,
                 "delivery": blob, "created_at": row[5]}
 
     def steps(self, task_id: str) -> list[dict[str, Any]]:
-        rows = self.db.execute("SELECT * FROM steps WHERE task_id=? ORDER BY created_at DESC", (task_id,))
+        rows = self.db.execute("SELECT * FROM steps WHERE task_id=? ORDER BY rowid DESC", (task_id,))
         return [dict(r) for r in rows]
 
     def out_dir(self, task_id: str) -> Path:
@@ -469,6 +497,7 @@ class WorkflowDB(ResearchDB):
                               (paper_id,)).fetchone()
         return dict(row) if row else None
 
+    @project_notes.synchronized
     def save_md_note(self, nid: str, title: str, content: str, task_id: str | None = None,
                      paper_id: str | None = None) -> dict[str, Any]:
         """task_id / paper_id 传 None 保持原绑定不变；传 "" 就是解绑。"""
@@ -501,12 +530,20 @@ class WorkflowDB(ResearchDB):
                                     title=note["title"], source="md_notes", body=note["content"],
                                     metadata={"paper_id": note["paper_id"], "legacy_id": nid})
         self._link_note_paper_asset(note["task_id"], note["paper_id"], path)
+        import semantic
+        semantic.invalidate_source(self, "md_note", nid)
+        self.db.commit()
         note["canonical_path"] = str(path)
         return note
 
     def _md_note_path(self, note: dict[str, Any] | None) -> Path | None:
         if not note:
             return None
+        import asset_service
+        for asset in asset_service.find_by_metadata(self, project_id=note["task_id"], kind="note",
+                                                    key="legacy_id", value=note["id"]):
+            if asset["storage"] == "file" and asset["status"] == "active" and asset["project_id"] == note["task_id"]:
+                return Path(asset["canonical_uri"])
         if not note["task_id"]:
             return NOTES / f"{note['id']}.md"
         return self._project_note_dir(note["task_id"]) / f"{note['id']}.md"
@@ -559,12 +596,15 @@ class WorkflowDB(ResearchDB):
         else:
             self.db.commit()
 
+    @project_notes.synchronized
     def delete_md_note(self, nid: str) -> None:
         note = self.md_note(nid)
         path = self._md_note_path(note)
         import asset_service
         assets = asset_service.find_by_metadata(self, kind="note", key="legacy_id", value=nid)
         self.db.execute("DELETE FROM md_notes WHERE id=?", (nid,))
+        import semantic
+        semantic.invalidate_source(self, "md_note", nid)
         for asset in assets:
             self.db.execute("UPDATE assets SET status='archived', updated_at=? WHERE id=?",
                             (now(), asset["id"]))
@@ -711,10 +751,12 @@ class WorkflowDB(ResearchDB):
 
     # ---------- 定时任务（规则 + 每次运行一条记录） ----------
     def schedules(self) -> list[dict[str, Any]]:
-        return [dict(r) for r in self.db.execute("SELECT * FROM schedules ORDER BY created_at").fetchall()]
+        return [dict(r) for r in self.db.execute("SELECT s.*,COALESCE(l.todo_id,'') AS todo_id FROM schedules s "
+                    "LEFT JOIN task_links l ON l.schedule_id=s.id ORDER BY s.created_at").fetchall()]
 
     def schedule(self, sid: str) -> dict[str, Any] | None:
-        row = self.db.execute("SELECT * FROM schedules WHERE id=?", (str(sid or ""),)).fetchone()
+        row = self.db.execute("SELECT s.*,COALESCE(l.todo_id,'') AS todo_id FROM schedules s "
+                              "LEFT JOIN task_links l ON l.schedule_id=s.id WHERE s.id=?", (str(sid or ""),)).fetchone()
         return dict(row) if row else None
 
     def schedule_save(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -724,6 +766,13 @@ class WorkflowDB(ResearchDB):
         assistant_id = str(data.get("assistant_id") or "").strip()
         if assistant_id and (not self.assistant(assistant_id) or not self.assistant(assistant_id).get("enabled")):
             raise ValueError("绑定的专家不存在或已停用")
+        linked = self.db.execute("SELECT project_id FROM task_links WHERE schedule_id=?", (sid,)).fetchone()
+        if linked and linked["project_id"] != str(data.get("project_id") or ""):
+            raise ValueError("已关联待办的定时任务不能转移到其他项目")
+        if data.get("todo_id"):
+            import project_todos
+            project_todos.bind_execution(self, str(data["todo_id"]), str(data.get("project_id") or ""),
+                                         schedule_id=sid, commit=False)
         fields = (str(data.get("name") or "未命名任务"), str(data.get("prompt") or ""),
                   str(data.get("project_id") or ""), str(data.get("frequency") or "daily"),
                   str(data.get("cron") or "0 9 * * *"), str(data.get("output_dir") or "定时任务"),
@@ -748,6 +797,10 @@ class WorkflowDB(ResearchDB):
         self.db.commit()
 
     def schedule_delete(self, sid: str) -> None:
+        import project_todos
+        import schedule
+        schedule.cancel_run(sid, self.path)
+        project_todos.sync_execution(self, schedule_id=sid, status="cancelled")
         self.db.execute("DELETE FROM schedule_runs WHERE schedule_id=?", (str(sid or ""),))
         self.db.execute("DELETE FROM schedules WHERE id=?", (str(sid or ""),))
         self.db.commit()
@@ -856,7 +909,8 @@ class WorkflowDB(ResearchDB):
 
     def team_task_add(self, task_id: str, member_id: str, member_name: str, title: str, prompt: str,
                       trigger: str = "leader", origin: str = "", depends_on: list[str] | None = None,
-                      output_contract: dict[str, Any] | None = None, reviewer_id: str = "") -> dict[str, Any]:
+                      output_contract: dict[str, Any] | None = None, reviewer_id: str = "",
+                      *, commit: bool = True) -> dict[str, Any]:
         depends = json.dumps(depends_on or [], ensure_ascii=False)
         contract = json.dumps(output_contract or {}, ensure_ascii=False)
         review_status = "pending" if reviewer_id else "not_required"
@@ -869,7 +923,8 @@ class WorkflowDB(ResearchDB):
              output_path,result,reason,trigger,origin,attempt,checkpoint,retry_at,run_id,input_assets,output_assets,review_status,
              depends_on,output_contract,reviewer_id,review_attempt,approved_at,review_feedback)
             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", row)
-        self.db.commit()
+        if commit:
+            self.db.commit()
         return dict(self.db.execute("SELECT * FROM team_tasks WHERE id=?", (row[0],)).fetchone())
 
     def team_task_mark(self, tid: str, status: str, **fields: Any) -> None:
@@ -892,6 +947,9 @@ class WorkflowDB(ResearchDB):
         sets = ", ".join("%s=?" % k for k in allow)
         self.db.execute("UPDATE team_tasks SET %s WHERE id=?" % sets, (*allow.values(), tid))
         self.db.commit()
+        import project_todos
+        project_todos.sync_execution(self, team_task_id=tid, status=status,
+                                     run_id=str(fields.get("run_id") or ""), assets=fields.get("output_assets"))
 
     # ---------- 团队表（一个团队 = 一条记录；成员/记录都挂在它的 id 上） ----------
     def teams(self) -> list[dict[str, Any]]:
@@ -1070,25 +1128,47 @@ class WorkflowDB(ResearchDB):
 
 
     def stage_map(self, task_id: str) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for row in reversed(self.steps(task_id)):
-            out[row["stage"]] = row["status"]
-        return out
+        import workflow_state
+        return {step: item["status"] for step, item in workflow_state.states(self, task_id).items()}
 
     def stage_now(self, task_id: str, fallback: str = "") -> str:
         """项目现在走到哪一步：十步里「按顺序最靠后的已完成步」（和看板同一个口径）。
         一条步骤记录都没有的项目才按任务自身阶段兜底。"""
         has_step = self.db.execute("SELECT 1 FROM steps WHERE task_id=? LIMIT 1", (task_id,)).fetchone()
         if has_step:
-            return STAGE_LABEL.get(current_stage_key(self.db, task_id), "未开始")
+            import workflow_state
+            states = workflow_state.states(self, task_id)
+            return STAGE_LABEL.get(current_stage_key(self.db, task_id, list(states), states), "未开始")
         return {"definition": STAGE_LABEL["idea"], "reading": STAGE_LABEL["download"]}.get(fallback, "未开始")
 
+    @project_notes.synchronized
     def delete_task(self, task_id: str) -> dict[str, Any]:
         """删掉一个项目连带它的全部数据。SQLite 默认不启用外键约束，子表得自己清
         （paper_pages / evidence 没有 task_id，只能经 papers 关联）。
         磁盘上只删 data/papers 里我们自己存的 PDF 副本，用户自己的原文件不动。"""
         if self.db.execute("SELECT 1 FROM research_tasks WHERE id=?", (task_id,)).fetchone() is None:
             raise KeyError(task_id)
+        from run_manager import RunManager
+        manager = RunManager.get_instance()
+        async_ids = [r["id"] for r in self.db.execute("SELECT id FROM tasks WHERE owner_id=?", (task_id,))]
+        for rid in async_ids:
+            manager.cancel_run(rid)
+        import team
+        import schedule
+        for row in self.db.execute("SELECT id FROM schedules WHERE project_id=?", (task_id,)):
+            schedule.cancel_run(row["id"], self.path)
+        for row in self.db.execute("SELECT id FROM team_tasks WHERE task_id=?", (task_id,)):
+            signal = team._cancel_signals.get(row["id"])
+            if signal:
+                signal.set()
+        import semantic
+        semantic.invalidate_project(self, task_id)
+        self.db.execute("DELETE FROM task_attempts WHERE task_id IN (SELECT id FROM tasks WHERE owner_id=?)", (task_id,))
+        self.db.execute("DELETE FROM run_events WHERE run_id IN (SELECT id FROM tasks WHERE owner_id=?)", (task_id,))
+        self.db.execute("DELETE FROM tasks WHERE owner_id=?", (task_id,))
+        self.db.execute("DELETE FROM schedule_runs WHERE schedule_id IN (SELECT id FROM schedules WHERE project_id=?)", (task_id,))
+        self.db.execute("DELETE FROM schedules WHERE project_id=?", (task_id,))
+        self.db.execute("DELETE FROM task_links WHERE project_id=?", (task_id,))
         files = [r["source_path"] for r in self.db.execute("SELECT source_path FROM papers WHERE task_id=?", (task_id,))]
         self.db.execute("DELETE FROM paper_pages WHERE paper_id IN (SELECT id FROM papers WHERE task_id=?)", (task_id,))
         self.db.execute("DELETE FROM evidence WHERE paper_id IN (SELECT id FROM papers WHERE task_id=?)", (task_id,))
@@ -1355,8 +1435,9 @@ class WorkflowDB(ResearchDB):
             if not it.get("title"):
                 continue
             key = (self.db.execute(
-                "SELECT 1 FROM search_cache WHERE task_id=? AND source=? AND (doi=? AND doi!='' OR title=?)",
-                (task_id, it.get("source", ""), it.get("doi", ""), it.get("title", "")),
+                "SELECT 1 FROM search_cache WHERE task_id=? AND source=? "
+                "AND (lower(trim(doi))=lower(trim(?)) AND trim(doi)!='' OR title=? AND (trim(doi)='' OR trim(?)=''))",
+                (task_id, it.get("source", ""), it.get("doi", ""), it.get("title", ""), it.get("doi", "")),
             ).fetchone())
             if key:
                 continue
@@ -1377,8 +1458,9 @@ class WorkflowDB(ResearchDB):
         if not title:
             raise ValueError("这条没有标题，跳过")
         row = self.db.execute(
-            "SELECT id FROM search_cache WHERE task_id=? AND source=? AND (doi=? AND doi!='' OR title=?)",
-            (task_id, it.get("source", ""), it.get("doi", ""), title),
+            "SELECT id FROM search_cache WHERE task_id=? AND source=? "
+            "AND (lower(trim(doi))=lower(trim(?)) AND trim(doi)!='' OR title=? AND (trim(doi)='' OR trim(?)=''))",
+            (task_id, it.get("source", ""), it.get("doi", ""), title, it.get("doi", "")),
         ).fetchone()
         if row:
             return row["id"]
@@ -1403,6 +1485,7 @@ class WorkflowDB(ResearchDB):
         return [dict(r) for r in rows]
 
     # ---------- 笔记 ----------
+    @project_notes.synchronized
     def add_note(self, task_id: str, title: str, markdown: str, paper_id: str | None = None,
                  category: str = NOTE_CATEGORY) -> dict[str, Any]:
         nid = uuid.uuid4().hex

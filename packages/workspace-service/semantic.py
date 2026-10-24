@@ -3,8 +3,8 @@
 
 设计口径（改动前先读这四条）：
 
-1. 索引是派生数据。内容哈希 + 模型名都没变就跳过，所以**任何写入方都不用挂钩子**——
-   论文入库、笔记保存、证据摘录都不需要改代码，下次 sync 自然补上。
+1. 索引是派生数据。内容哈希 + 模型名都没变就跳过；笔记修改或删除会作废旧块，
+   下次 sync 再补齐当前内容，避免旧材料继续参与检索。
 2. 页码跟着块走。论文按页切块，命中就能回指「文件名 p.N」；这是科研检索的硬要求，
    比相似度多零点零几重要得多。
 3. 检索恒有两条腿。词法是 FTS5 trigram（中文可切），向量是 numpy 余弦。
@@ -275,6 +275,8 @@ def sync(db: Any, limit: int = 0, progress: Any = None) -> dict[str, Any]:
     """
     cfg = config(db)
     conn = db.db
+    prune_orphans(db)
+    conn.commit()
     stats = {"scanned": 0, "indexed": 0, "skipped": 0, "chunks": 0, "failed": 0,
              "model": cfg["model"], "errors": []}
     state = {(r["source_kind"], r["source_id"]): (r["content_hash"], r["model"])
@@ -315,16 +317,21 @@ def _index_source(conn: sqlite3.Connection, src: dict[str, Any], content_hash: s
         for i, piece in enumerate(chunk_text(text)):
             if _worth_indexing(piece):
                 chunks.append((int(page_no), i, piece))
+    mat = embed([c[2] for c in chunks], cfg) if chunks else None
+    if chunks and mat.shape[0] != len(chunks):
+        raise EmbedError("嵌入条数与块数不符")
+    # Acquire the SQLite write transaction before checking whether a source was
+    # deleted while the embedding request was in flight.
     _drop_source(conn, src["kind"], src["id"])
+    if not _source_exists(conn, src["kind"], src["id"], src["project_id"]):
+        conn.execute("DELETE FROM sem_state WHERE source_kind=? AND source_id=?", (src["kind"], src["id"]))
+        return 0
     if not chunks:
         conn.execute("""INSERT OR REPLACE INTO sem_state
             (source_kind, source_id, project_id, content_hash, model, dim, chunks, indexed_at)
             VALUES (?,?,?,?,?,0,0,?)""",
                      (src["kind"], src["id"], src["project_id"], content_hash, cfg["model"], _now()))
         return 0
-    mat = embed([c[2] for c in chunks], cfg)
-    if mat.shape[0] != len(chunks):
-        raise EmbedError("嵌入条数与块数不符")
     dim = int(mat.shape[1])
     now_iso = _now()
     for (page_no, ordv, text), vec in zip(chunks, mat):
@@ -346,6 +353,41 @@ def _drop_source(conn: sqlite3.Connection, kind: str, sid: str) -> None:
     conn.execute("DELETE FROM sem_fts WHERE rowid IN "
                  "(SELECT rowid FROM sem_chunks WHERE source_kind=? AND source_id=?)", (kind, sid))
     conn.execute("DELETE FROM sem_chunks WHERE source_kind=? AND source_id=?", (kind, sid))
+
+
+def invalidate_source(db: Any, kind: str, sid: str) -> None:
+    """Remove obsolete derived content; the next sync can index the current row."""
+    _drop_source(db.db, kind, sid)
+    db.db.execute("DELETE FROM sem_state WHERE source_kind=? AND source_id=?", (kind, sid))
+    with _LOCK:
+        _MATRIX_CACHE.clear()
+
+
+def invalidate_project(db: Any, project_id: str) -> None:
+    db.db.execute("DELETE FROM sem_fts WHERE rowid IN (SELECT rowid FROM sem_chunks WHERE project_id=?)", (project_id,))
+    db.db.execute("DELETE FROM sem_chunks WHERE project_id=?", (project_id,))
+    db.db.execute("DELETE FROM sem_state WHERE project_id=?", (project_id,))
+    with _LOCK:
+        _MATRIX_CACHE.clear()
+
+
+def _source_exists(conn: sqlite3.Connection, kind: str, sid: str, project_id: str) -> bool:
+    if project_id and not conn.execute("SELECT 1 FROM research_tasks WHERE id=?", (project_id,)).fetchone():
+        return False
+    if kind == "evidence":
+        return bool(conn.execute("SELECT 1 FROM evidence e JOIN papers p ON p.id=e.paper_id "
+                                 "WHERE e.id=? AND COALESCE(p.task_id,'')=?", (sid, project_id)).fetchone())
+    table = {"paper": "papers", "note": "notes", "md_note": "md_notes"}.get(kind)
+    return bool(table and conn.execute(f"SELECT 1 FROM {table} WHERE id=? AND COALESCE(task_id,'')=?",
+                                       (sid, project_id)).fetchone())
+
+
+def prune_orphans(db: Any) -> None:
+    sources = db.db.execute("SELECT source_kind,source_id,project_id FROM sem_state UNION "
+                            "SELECT source_kind,source_id,project_id FROM sem_chunks").fetchall()
+    for row in sources:
+        if not _source_exists(db.db, row["source_kind"], row["source_id"], row["project_id"] or ""):
+            invalidate_source(db, row["source_kind"], row["source_id"])
 
 
 def _now() -> str:
@@ -461,11 +503,15 @@ def lexical(db: Any, query: str, project_ids: list[str] | None = None, k: int = 
     """词法召回。≥3 字符走 FTS5 trigram（中文可切、带 bm25 排序）；
     更短的查（「掺杂」「层状」）trigram 切不出 token，退回 LIKE 子串扫。"""
     q = (query or "").strip()
-    if not q:
+    if not q or k <= 0 or project_ids == []:
         return []
     conn = db.db
     names = _project_names(conn)
-    scope = set(project_ids) if project_ids is not None else None
+    scope = ""
+    params = []
+    if project_ids is not None:
+        params = list(dict.fromkeys(project_ids))
+        scope = " AND COALESCE(c.project_id,'') IN (%s)" % ",".join("?" for _ in params)
     rows: list[sqlite3.Row] = []
     terms = [t for t in re.split(r"[\s,，、;；:：()（）\[\]【】]+", q) if len(t) >= 3]
     if terms:
@@ -473,17 +519,15 @@ def lexical(db: Any, query: str, project_ids: list[str] | None = None, k: int = 
         try:
             rows = conn.execute("""
                 SELECT c.* FROM sem_fts f JOIN sem_chunks c ON c.rowid = f.rowid
-                WHERE sem_fts MATCH ? ORDER BY bm25(sem_fts) LIMIT ?""",
-                                (match, k * 4)).fetchall()
+                WHERE sem_fts MATCH ?""" + scope + " ORDER BY bm25(sem_fts) LIMIT ?",
+                                [match, *params, k]).fetchall()
         except sqlite3.Error:
             rows = []
     if not rows:
-        rows = conn.execute("SELECT * FROM sem_chunks WHERE text LIKE ? ORDER BY length(text) LIMIT ?",
-                            ("%" + q + "%", k * 4)).fetchall()
+        rows = conn.execute("SELECT c.* FROM sem_chunks c WHERE c.text LIKE ?" + scope + " ORDER BY length(c.text) LIMIT ?",
+                            ["%" + q + "%", *params, k]).fetchall()
     out: list[dict[str, Any]] = []
     for rank, row in enumerate(rows):
-        if scope is not None and (row["project_id"] or "") not in scope:
-            continue
         hit = _hit(row, 1.0 / (rank + 1), names)
         hit["lexical"] = True
         out.append(hit)
