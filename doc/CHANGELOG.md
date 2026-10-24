@@ -2,6 +2,14 @@
 
 > 一轮改动一条，给 PR / 交接用。只写「改了什么、影响谁、怎么验」。
 
+## 2026-10-24（1.1.1：修打包漏 migrations/ —— 装完打开是白屏）
+
+**问题**：1.1 的 Setup/Portable 里没有 `migrations/`。`run_migrations()` 找不到目录就 `return []`，不报错；新机器上 `task_links`、`project_todos` 关联表一类的表建不出来，`/api/state` 直接 500（`OperationalError: no such table: task_links`），浏览器里就是打不开的白屏。从源码跑不触发，因为仓库根就有 `migrations/`。
+
+**做法**：`tools/览籍智研.spec` 的 datas 补一条 `(migrations, 'migrations')` —— 冻结包里迁移脚本落在 exe 同目录，`app_dir()/migrations` 才找得到。
+
+**验证**：重打后清空数据根、起 exe，`/api/state` 200，`research.sqlite3` 里 63+ 表且 `task_links` 存在；老数据根（已应用 010 迁移）照常。
+
 ## 2026-10-24（1.1：引用导出成形、笔记树、工作流验收与并发加固）
 
 **引用导出**：PDF / Word / HTML / Markdown 四个出口都带引用 —— PDF 走 `\cite` + 参考文献表（样式可选），其余三出口把 `{{Cn}}` 换成按正文出现顺序编的 `[n]` 并自动接「参考文献」节，台账里查不到的编号保留原标记并在 `cites.missing` 里报出来。著者-出版年制照 GB/T 7714 自带 `.bst` 的实测规则实现（1–3 位全列、≥4 位用「等」、同年加 a/b、文后按著者字顺），PDF 端 AY 样式明确退回数字式并给出说明。
