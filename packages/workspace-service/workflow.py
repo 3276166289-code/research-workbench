@@ -1351,6 +1351,8 @@ def run_agent(db: "WorkflowDB", task_id: str, text: str, emit: Any = None, max_s
     final = ""
     tokens = {"prompt": 0, "completion": 0, "total": 0, "exact": True}
     first_turn = int(resume.get("turn", 0)) if resume.get("messages") else 0
+    # 同一轮 run 内模型重复发「同名同参数」的调用，直接复用上次结果（实测有轮次把同一份 map_write 发了 4 次）
+    _done_calls: dict[str, Any] = {}
     save_checkpoint(phase="model", messages=messages, turn=first_turn, workflow_run_id=tracked_run["id"], node_id=tracked_node["id"])
     for turn in range(first_turn, max_steps):
         if cancel_check and cancel_check():
@@ -1440,6 +1442,7 @@ def run_agent(db: "WorkflowDB", task_id: str, text: str, emit: Any = None, max_s
                 args = {}
             ev = {"type": "tool_call", "name": name, "args": args, "id": call.get("id")}
             say(ev); events.append(ev)
+            cache_key = name + "\x00" + json.dumps(args, sort_keys=True, ensure_ascii=False, default=str)
             t_tool_start = time.monotonic()
             save_checkpoint(phase="tool", messages=messages, events=events, turn=turn)
             try:
@@ -1447,7 +1450,9 @@ def run_agent(db: "WorkflowDB", task_id: str, text: str, emit: Any = None, max_s
                     raise PermissionError("当前助手未获准使用此工具：" + name)
                 enforce_tool_policy(name, args, permission)
                 enforce_project_scope(db, bound, name, args)
-                if name in integration_names:
+                if name != "delegate" and cache_key in _done_calls:
+                    result = _done_calls[cache_key]
+                elif name in integration_names:
                     result = agent_integrations.invoke(name, db, ctx_id, args, assistant_id=aid, permission=permission)
                 elif name in ("skill_read", "skill_write") or (name.startswith("mcp_") and name != "mcp_register"):
                     result = capabilities.invoke_tool(db, aid, name, args, project_dir)
@@ -1456,6 +1461,8 @@ def run_agent(db: "WorkflowDB", task_id: str, text: str, emit: Any = None, max_s
                 if isinstance(result, dict) and result.get("sub_events"):
                     events.extend(result["sub_events"])      # 子 agent 的事件并进本轮 → 回放可还原
                 ok, brief = True, _brief(name, result)
+                if name != "delegate" and not (isinstance(result, dict) and result.get("sub_events")):
+                    _done_calls[cache_key] = result      # 带 sub_events 的结果不缓存：复用会重复回放子事件
             except execution.Cancelled:
                 raise
             except Exception as exc:
