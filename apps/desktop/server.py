@@ -1149,7 +1149,7 @@ class Handler(StarmapRoutes, CoreRoutes, WorkflowRoutes, MiscRoutes, UpdateRoute
                 with WorkflowDB(DB_PATH) as tb_db:
                     asset = asset_service.get(tb_db, (q.get("asset_id") or [""])[0])
                     if (not asset or asset["project_id"] != (q.get("project_id") or [""])[0]
-                            or asset["source"] not in ("image_conversion", "image_caption")):
+                            or asset["source"] not in ("image_conversion", "image_caption", "document_conversion")):
                         return self._json({"error": "文件不存在或不属于当前项目"}, 404)
                     target = Path(asset["canonical_uri"])
                     if not target.is_file():
