@@ -10,6 +10,7 @@ from typing import Any
 import os
 import subprocess
 import sys
+import json
 import time
 import workflow_layout
 
@@ -91,7 +92,38 @@ class CoreRoutes:
                 return self._json({"notes": db.notes(tid) if tid else db.notes()})
         if path == "/api/chat":
             with WorkflowDB(DB_PATH) as db:
-                return self._json({"messages": db.messages(q["id"][0])})
+                from execution_conversations import read
+                from workspace_trajectory import safe_result
+
+                chat_id = q["id"][0]
+                execution = read(db, chat_id)
+                if execution is not None:
+                    return self._json(execution)
+                messages = db.messages(chat_id)
+                row = db.db.execute(
+                    "SELECT id, status, checkpoint, updated_at FROM tasks "
+                    "WHERE owner_id=? AND kind='agent_run' ORDER BY rowid DESC LIMIT 1",
+                    (chat_id,)).fetchone()
+                if row and row["status"] in ("failed", "interrupted") and not any(
+                    message.get("run_id") == row["id"] for message in messages
+                ):
+                    checkpoint = json.loads(row["checkpoint"] or "{}")
+                    raw_events = [item["payload"] for item in db.get_run_events(row["id"])
+                                  if isinstance(item["payload"], dict)]
+                    errors = [item.get("message") or item.get("error") or item.get("summary")
+                              for item in raw_events if item.get("type") == "error"]
+                    reason = next((value for value in reversed(errors) if value and value != "error"), None)
+                    reason = reason or checkpoint.get("error") or "请展开执行轨迹查看已记录的模型与工具事件。"
+                    if reason == "error":
+                        reason = "请展开执行轨迹查看已记录的模型与工具事件。"
+                    heading = "执行中断：" if row["status"] == "interrupted" else "执行失败："
+                    messages.append({"id": row["id"], "role": "assistant",
+                                     "content": heading + str(safe_result(reason)),
+                                     "created_at": row["updated_at"], "status": row["status"],
+                                     "run_id": row["id"],
+                                     "events": [safe_result(event) for event in raw_events[-100:]
+                                                if event.get("type") not in ("user", "assistant_delta", "reasoning_delta")]})
+                return self._json({"messages": messages})
         if path == "/api/security":                   # 权限模式：all=不再逐次问，ask=编译/写文件每次问
             with WorkflowDB(DB_PATH) as db:
                 sec = kv_store.read(db, "security")

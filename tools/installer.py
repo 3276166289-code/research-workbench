@@ -143,7 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     if sys.stdout is not None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     local = Path(os.environ["LOCALAPPDATA"])
-    root = local / APP
+    root = local / (APP + "-1.0")
     app_dir = args.install_dir or local / "LanjiZhiyan" / "app"
     here = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
     try:

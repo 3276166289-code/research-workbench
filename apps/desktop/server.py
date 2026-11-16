@@ -7,7 +7,9 @@
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import tempfile
 import json
 import re
 import os
@@ -111,6 +113,7 @@ if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 from handlers.starmap import StarmapRoutes          # do_GET 的路由按域分片（见 handlers/*.py）
 from handlers.core import CoreRoutes
+from handlers.update import UpdateRoutes, install_current_release
 from handlers.wf_routes import WorkflowRoutes
 from handlers.misc import MiscRoutes
 from run_manager import RunManager
@@ -501,6 +504,31 @@ class _WinBridge:
             return {"error": str(exc)}
 
 
+    def save_export(self, filename: str, encoded: str) -> dict[str, Any]:
+        import webview
+
+        name = Path(filename).name
+        if name in ("", ".", "..") or name != filename or len(encoded) > 48 * 1024 * 1024:
+            return {"error": "导出文件名无效或文件过大"}
+        try:
+            contents = base64.b64decode(encoded, validate=True)
+            selection = webview.windows[0].create_file_dialog(webview.FileDialog.SAVE, save_filename=name)
+            if not selection:
+                return {"cancelled": True}
+            target = Path(selection[0] if isinstance(selection, (list, tuple)) else selection)
+            stream = tempfile.NamedTemporaryFile(dir=target.parent, prefix=".lanji-export-", delete=False)
+            temporary = Path(stream.name)
+            try:
+                with stream:
+                    stream.write(contents)
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+            return {"path": str(target)}
+        except (OSError, TypeError, ValueError) as exc:
+            return {"error": str(exc)}
+
+
 def _webview_window(url: str, stamp: int) -> bool:
     """自己的无边框窗口（WebView2 / pywebview）。起来就阻塞到关窗、返回 True；
     起不来（没装 pywebview / WebView2 运行时）返回 False，调用方退回 Edge --app。"""
@@ -508,6 +536,7 @@ def _webview_window(url: str, stamp: int) -> bool:
         import webview
     except Exception:
         return False
+    webview.settings["ALLOW_DOWNLOADS"] = True
     # 打包后图标在 exe 目录的 build/icon.ico（spec 把 tools/build 打进去），源码跑在 tools/build/icon.ico
     icon = ROOT / "build" / "icon.ico"
     if not icon.is_file():
@@ -702,7 +731,7 @@ class Server(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
-class Handler(StarmapRoutes, CoreRoutes, WorkflowRoutes, MiscRoutes, BaseHTTPRequestHandler):
+class Handler(StarmapRoutes, CoreRoutes, WorkflowRoutes, MiscRoutes, UpdateRoutes, BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, *args: Any) -> None:  # 静默
@@ -1132,7 +1161,7 @@ class Handler(StarmapRoutes, CoreRoutes, WorkflowRoutes, MiscRoutes, BaseHTTPReq
             if self._mail_route("GET", path, q, None):
                 return
             # ---- 各域路由（handlers/*）：命中即返回 ----
-            for fn in (self._r_starmap, self._r_core, self._r_workflow, self._r_misc):
+            for fn in (self._r_starmap, self._r_core, self._r_workflow, self._r_misc, self._r_update):
                 r = fn(path, q)
                 if r is not None or self._responded:
                     return r
@@ -1168,6 +1197,8 @@ class Handler(StarmapRoutes, CoreRoutes, WorkflowRoutes, MiscRoutes, BaseHTTPReq
             self._drain()
             return self._json({"error": "只接受 application/json"}, 415)
         data = self._body()
+        if path == "/api/app/update/install":
+            return self._p_update()
         if self._extension_route("POST", path, data, q):
             return
         if self._mail_route("POST", path, q, data):
@@ -1994,6 +2025,12 @@ def _start_grant_helper():
                     elif self.path == "/open":          # 文档/目录只有 Medium 开得动
                         target = str(data.get("target") or "")
                         ok = bool(target) and _host_open(target)
+                    elif self.path == "/update":
+                        try:
+                            result = install_current_release()
+                            ok = True
+                        except (OSError, ValueError, RuntimeError) as exc:
+                            result = {"error": str(exc)}
                     elif self.path == "/account":       # 官方账号客户端只能在宿主（Medium）里跑
                         import account_providers
                         result = account_providers.host_request(data)
@@ -2007,7 +2044,7 @@ def _start_grant_helper():
                                 ok = True
                 except (OSError, ValueError, KeyError):
                     ok = False
-            body = json.dumps(result if self.path in ("/pick", "/tex", "/account") and 'result' in locals() else {"ok": ok}).encode()
+            body = json.dumps(result if self.path in ("/pick", "/tex", "/account", "/update") and 'result' in locals() else {"ok": ok}).encode()
             self.send_response(200 if ok else 403)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
